@@ -71,6 +71,8 @@ class InferenceEngine(Module):
         self.module = model
 
         self._get_model_config_generate(config)
+        # If there is no configuration being feed in, generate configuration from model
+        # Otherwise get from args
 
         self.mp_world_size = mp_size
         self.checkpoint = checkpoint
@@ -106,6 +108,7 @@ class InferenceEngine(Module):
 
         moe, _ = has_moe_layers(self.module)
 
+        print(f"Automatically fetched configuration is {self.config}")
         if moe and dist.get_world_size() > 1:
             self._create_ep_parallel_group(moe_experts)
 

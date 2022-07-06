@@ -13,7 +13,8 @@ TORCH_DISTRIBUTED_DEFAULT_PORT = 29500
 # (only if NCCL_BLOCKING_WAIT or NCCL_ASYNC_ERROR_HANDLING is set to 1).
 # To make an attempt at backwards compatibility with THD, we use an
 # extraordinarily high default timeout, given that THD did not have timeouts.
-default_pg_timeout = timedelta(minutes=30)
+# HH: Reduced to 1min for Debugging purpose
+default_pg_timeout = timedelta(minutes=10)
 
 INFERENCE_GENERIC_MODE = 'generic'
 INFERENCE_SPECIALIZED_MODE = 'specialized'

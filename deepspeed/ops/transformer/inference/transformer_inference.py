@@ -244,6 +244,8 @@ class DeepSpeedSelfAttentionFunction(Function):
 
                 return context_layer, presents[0], presents[1] # atten_output, key_layer, value_layer
             else:
+                # we got error here since not q_int 8
+                print(f"qkv_out is on which device: {qkv_out.get_device()}")
                 attn_key_value = score_context_func(
                     qkv_out,
                     input_mask,
@@ -263,9 +265,11 @@ class DeepSpeedSelfAttentionFunction(Function):
                 return context_layer, key_layer, value_layer
 
         def selfAttention_fp():
+            # print(f"FP16: {config.fp16}") # Figure out where FP16 is being set
             vector_matmul_func = inference_cuda_module.vector_matmul_fp16 if config.fp16 else \
                                     inference_cuda_module.vector_matmul_fp32
             if not config.pre_layer_norm:
+                # print(f"***Pre Layer Norm is not set")
                 linear_func = inference_cuda_module.linear_layer_fp16 if config.fp16 else \
                                     inference_cuda_module.linear_layer_fp32
 
@@ -273,7 +277,9 @@ class DeepSpeedSelfAttentionFunction(Function):
                                       attn_qkvw,
                                       attn_qkvb,
                                       DeepSpeedTransformerInference.layer_id)
+                print_(f"qkv: sizes: {qkv_out[0].size()}, {qkv_out[1].size()} {qkv_out}")
             else:
+                # print(f"***Pre Layer Norm is set") # it is set to true
                 qkv_func = inference_cuda_module.qkv_gemm_fp16 if config.fp16 else \
                                     inference_cuda_module.qkv_gemm_fp32
 
@@ -285,6 +291,7 @@ class DeepSpeedSelfAttentionFunction(Function):
                                    config.epsilon,
                                    (attn_qkvb is not None),
                                    DeepSpeedTransformerInference.layer_id)
+                print_(f"qkv: sizes: {qkv_out[0].size()}, {qkv_out[1].size()} {qkv_out}")
 
             context_layer, key_layer, value_layer = compute_attention(qkv_out[0] if isinstance(qkv_out, list) else qkv_out, input_mask)
             output = vector_matmul_func(context_layer, attn_ow, False)
@@ -376,8 +383,9 @@ class DeepSpeedSelfAttention(nn.Module):
             math.sqrt(self.config.hidden_size // self.config.heads))
         self.qkv_merging = qkv_merging
 
+        # THIS IS THE BUGGY PIECE
         self.score_context_func = inference_cuda_module.softmax_context_fp32 if (not config.fp16) else \
-                                    inference_cuda_module.softmax_context_fp16
+                                    inference_cuda_module.softmax_context_fp16 
 
     def forward(self,
                 input,
@@ -634,7 +642,9 @@ class DeepSpeedTransformerInference(nn.Module):
         get_present = (get_present or get_key_value or use_cache)
         input_mask = input_mask if attention_mask is None else attention_mask
         layer_past = layer_past if layer_past is not None else self.layer_past
-
+        print_(f"This is the {self.config.layer_id}-th layer. This is a normal layer.")
+        print_(f"{self.config.layer_id}-th layer: First 3 rows of TFMR input {input.size()} is {input[:3]}")
+        # print(get_nvidia_smi_gpu_memory_stats_str())
         attn_mask = None
         if isinstance(input, tuple):
             attn_mask = input[1]
@@ -644,7 +654,8 @@ class DeepSpeedTransformerInference(nn.Module):
         if (self.config.fp16 or self.config.q_int8) \
             and input.dtype == torch.float:
             input = input.half()
-
+        # print(f"{self.config.layer_id}-th layer: First 3 rows of TFMR input after casting {input.size()} is {input[:3]}")
+        # print(get_nvidia_smi_gpu_memory_stats_str())
         with torch.no_grad():
             attention_output, key, value, context_outputtn_ctx, inp_norm = \
                                      self.attention(input,
@@ -659,8 +670,11 @@ class DeepSpeedTransformerInference(nn.Module):
                                               self.norm_b)
             presents = (key, value)
             self.layer_past = presents
+            print_(f"Is attention output a valid output?: {attention_output.type()} {attention_output.size()}")
+            print_(f"{self.config.layer_id}-th layer: First 3 rows of attn is {attention_output[:3]}")
 
             output = self.mlp(attention_output, input, inp_norm, self.attention.attn_ob)
+            print_(f"{self.config.layer_id}-th layer: First 3 rows of attn output is {output[:3]}")
 
             if not self.config.pre_layer_norm:
                 ds_layernorm = inference_cuda_module.layer_norm_fp16 if self.config.fp16 or self.config.q_int8 else \
@@ -671,8 +685,8 @@ class DeepSpeedTransformerInference(nn.Module):
                                       self.config.epsilon)
 
             output = output.to(input_type)
-        #print(f'[{torch.distributed.get_rank()}] {self.config.layer_id}: {output.norm()}')
-        #exit()
+
+        print_(f"{self.config.layer_id}-th layer: First 3 rows of TFMR output is {output[:3]}")
         if get_present:
             output = (output, presents)
 
@@ -680,3 +694,10 @@ class DeepSpeedTransformerInference(nn.Module):
             return output if type(output) is tuple else (output, attn_mask)
         else:
             return output
+
+def get_nvidia_smi_gpu_memory_stats_str():
+    return f"nvidia-smi stats: ALLOC: {torch.cuda.memory_allocated()/1024/1024/1024:.3f}GB, RESERVED: {torch.cuda.memory_reserved()/1024/1024/1024:.3f}GB"
+
+def print_(content, *args, **kwargs):
+    torch.cuda.synchronize()
+    print(content, *args, **kwargs)

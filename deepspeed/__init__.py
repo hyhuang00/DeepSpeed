@@ -299,10 +299,10 @@ def init_inference(model,
                              replace_method,
                              quantization_setting,
                              replace_with_kernel_inject,
-                             moe,
-                             moe_experts,
-                             moe_type,
-                             args,
-                             enable_cuda_graph)
+                             moe=moe,
+                             moe_experts=moe_experts,
+                             moe_type=moe_type,
+                             config=args,
+                             enable_cuda_graph=enable_cuda_graph)
 
     return engine

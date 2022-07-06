@@ -23,6 +23,7 @@ from torch import Tensor
 import torch.distributed as dist
 from torch.nn import Module, ModuleList
 import torch.nn.functional as F
+import subprocess
 
 if TYPE_CHECKING:
     Base = Module[Tensor]
@@ -152,6 +153,7 @@ def _capacity(gates: Tensor, capacity_factor: Tensor, min_capacity: Tensor) -> T
     # to(torch.int64) works around a bug in torch.onnx.export:
     # it should cast k to int64 when converting torch.topk but it doesn't.
     capacity = torch.ceil((num_tokens / num_experts) * capacity_factor).to(torch.int64)
+    # print(f"****Num_tokens: {num_tokens}, capacity_factor: {capacity_factor}, capacity: {capacity}") # Resolved
     if capacity < min_capacity:
         capacity = min_capacity.to(torch.int64)
     return capacity
@@ -184,6 +186,8 @@ def top1gating(logits: Tensor,
     # everything is in fp32 in this function
     gates = F.softmax(logits, dim=1)
 
+    # print(f'*!*!*!capacity factor: {capacity_factor}, {torch.tensor(capacity_factor * 2)}')
+
     capacity = _capacity(gates,
                          torch.tensor(capacity_factor),
                          torch.tensor(min_capacity))
@@ -200,11 +204,14 @@ def top1gating(logits: Tensor,
     if used_token is not None:
         mask1 = einsum("s,se->se", used_token, mask1)
 
-    # gating decisions
-    exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+    # gating decisions -- why is it mapped to cpu?
+    # print("Before error:", get_nvidia_smi_gpu_memory_stats_str())
+    # exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+    exp_counts = torch.sum(mask1, dim=0)
 
     # if we don't want to drop any tokens
     if not drop_tokens:
+        # print('No drop tokens')
         new_capacity = torch.max(exp_counts).to(logits.device)
         dist.all_reduce(new_capacity, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
         capacity = new_capacity
@@ -278,6 +285,7 @@ def top2gating(logits: Tensor,
     # everything is in fp32 in this function
     gates = F.softmax(logits, dim=1)
 
+    # print(f'*!*!*!capacity factor: {capacity_factor}, {torch.tensor(capacity_factor * 2)}')
     capacity = _capacity(gates,
                          torch.tensor(capacity_factor * 2),
                          torch.tensor(min_capacity))
@@ -302,7 +310,8 @@ def top2gating(logits: Tensor,
     locations2 += torch.sum(mask1, dim=0, keepdim=True)
 
     # gating decisions
-    exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+    # exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+    exp_counts = torch.sum(mask1, dim=0)
 
     # Compute l_aux
     me = torch.mean(gates, dim=0)
@@ -362,7 +371,7 @@ class TopKGate(Module):
     def __init__(self,
                  model_dim: int,
                  num_experts: int,
-                 k: int = 1,
+                 k: int = 2,
                  capacity_factor: float = 1.0,
                  eval_capacity_factor: float = 1.0,
                  min_capacity: int = 8,
@@ -385,6 +394,7 @@ class TopKGate(Module):
         self.gate_time = 0.0
         self.drop_tokens = drop_tokens
         self.use_rts = use_rts
+        print(f"Top k={self.k} gate initialized with capacity factors: {self.capacity_factor}/{self.eval_capacity_factor}")
 
     def forward(
             self,
@@ -397,6 +407,7 @@ class TopKGate(Module):
         if self.wall_clock_breakdown:
             self.timers('TopKGate').start()
 
+        print(f'Gating function being called: Training {self.training}, k {self.k}, capacity factors: {self.capacity_factor}/{self.eval_capacity_factor}')
         if self.wg.weight.dtype != torch.float32:
             self.wg = self.wg.float()
         input_fp32 = input.float()
@@ -553,3 +564,37 @@ class MOELayer(Base):
             self.time_moe = self.timers('moe').elapsed(reset=False) * 1000
 
         return a
+
+
+def nvidia_smi_gpu_memory_stats():
+    """
+    Parse the nvidia-smi output and extract the memory used stats.
+    """
+    out_dict = {}
+    try:
+        sp = subprocess.Popen(
+            ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
+        out_str = sp.communicate()
+        out_list = out_str[0].decode("utf-8").split("\n")
+        out_dict = {}
+        for item in out_list:
+            if " MiB" in item:
+                gpu_idx, mem_used = item.split(",")
+                gpu_key = f"gpu_{gpu_idx}_mem_used_gb"
+                out_dict[gpu_key] = int(mem_used.strip().split(" ")[0]) / 1024
+    except FileNotFoundError:
+        print(
+            "Failed to find the 'nvidia-smi' executable for printing GPU stats"
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"nvidia-smi returned non zero error code: {e.returncode}")
+
+    return out_dict
+
+
+def get_nvidia_smi_gpu_memory_stats_str():
+    return "nvidia-smi stats: {}".format(nvidia_smi_gpu_memory_stats())

@@ -157,7 +157,13 @@ class DeepSpeedMLPFunction(Function):
                                    async_op)
         if mp_group is not None and dist.get_world_size(group=mp_group) > 1:
             dist.all_reduce(output, group=mp_group, async_op=async_op)
-
+        # print('Error happens')
+        # print(type(output)) # torch.Tensor
+        # print(type(output_b)) # 'torch.nn.parameter.Parameter' for bias
+        # print(output.size())
+        # print(output_b.size())
+        # print(output.device) # cuda:0
+        # print(output_b.device) # cuda:0
         return output + output_b
 
     @staticmethod
@@ -342,6 +348,7 @@ class DeepSpeedMoEInference(nn.Module):
                                      dtype=dispatched_input.dtype,
                                      device=dispatched_input.device)
         for chunk, expert in zip(chunks, range(len(self.mlp))):
+            # This is still a serialized execution -- why?
             expert_outputs[expert] = self.mlp[expert](chunk.view(
                 -1,
                 dispatched_input.shape[-2],
@@ -350,10 +357,19 @@ class DeepSpeedMoEInference(nn.Module):
 
     def _alltoall(self, dispatched_attention):
         if dist.get_world_size(group=self.ep_group) > 1:
-            dispatched_input = torch.empty_like(dispatched_attention)
+            dispatched_attention = dispatched_attention.contiguous() # HH: a fix from fairseq
+            dispatched_input = torch.empty_like(dispatched_attention) # HH: a fix from fairseq
+            print_("Prepared for output") # This line triggered but all to all is problematic
+            print_(f"Type: {dispatched_attention.type()}, Size: {dispatched_attention.size()}")
+            print(get_nvidia_smi_gpu_memory_stats_str())
+            dist.barrier() # HH: FIXME for debug purpose, synchronize all processes
             dist.all_to_all_single(dispatched_input,
                                    dispatched_attention,
                                    group=self.ep_group)
+            # dispatched_input = dispatched_attention
+            print_("All to all finished") # Halted here.
+            # NCCL backend may hang/crash when there are concurrent communication
+            # from different NCCL communicators
             return dispatched_input
         else:
             return dispatched_attention
@@ -385,6 +401,9 @@ class DeepSpeedMoEInference(nn.Module):
         input_mask = input_mask if attention_mask is None else attention_mask
         input_type = input.dtype
 
+        print_(f"This is the {self.config.layer_id}-th layer. This is an MoE layer.")
+        print_(f"{self.config.layer_id}-th layer: First 3 rows of MoE input is {input[:3]}")
+
         if (self.config.fp16 or self.config.q_int8) \
             and input.dtype == torch.float:
             input = input.half()
@@ -409,17 +428,29 @@ class DeepSpeedMoEInference(nn.Module):
             else:
                 attention_output = attention_output[0]
 
+            print_('Attention finished')
+            # print("Before error:", get_nvidia_smi_gpu_memory_stats_str())
+            # print(type(attention_output))
+            # print(type(self.attention.attn_ob))
+            # print(attention_output.size())
+            # print(self.attention.attn_ob.size())
+            # print(attention_output.data_ptr()) # cuda:0
+            # print(self.attention.attn_ob.data_ptr()) # cuda:0
+            # print(f"{self.config.layer_id}-th layer: First three items in MoE attn:",(self.attention.attn_ob + attention_output)[:3])
+            # print(get_nvidia_smi_gpu_memory_stats_str())
             residual_add = attention_output + self.attention.attn_ob
             attention_output = self.ds_layernorm(residual_add,
                                                  self.attn_nw,
                                                  self.attn_nb,
                                                  self.config.epsilon)
-
+            print_('Layernorm finished')
             if self.config.mlp_type == 'residual':
+                # print("PRMOE Triggered -- Should not happen") # Not being called
                 res_mlp_out = self.res_mlp(attention_output, async_op=True)
                 res_coef_out = self.res_coef_func(attention_output, async_op=True)
 
             if self.expert_mp_group is not None:
+                # print("Expert MP group not found -- No Expert Parallelism.") # Not being called
                 tensor_list = [
                     torch.empty_like(attention_output)
                     for _ in range(dist.get_world_size(group=self.expert_mp_group))
@@ -432,18 +463,30 @@ class DeepSpeedMoEInference(nn.Module):
 
             ############## MoE Gating + Experts ###############
             dispatched_attention, combined_weights = self.moe_gate_einsum(attention_output)
+            print('Gating computed')
+            print_(f"The dispatched attention of size {dispatched_attention.size()} is {dispatched_attention}")
+            print_(f"The gating output of size {combined_weights.size()} is {combined_weights.sum(dim=2)}\n")
             dispatched_input = self._alltoall(dispatched_attention)
+            print_(f'Tokens distributed: {dispatched_attention.size()}')
             expert_outputs = self.expert_exec(dispatched_input)
+            print_(f'Experts executed')
             expert_output = self._alltoall(expert_outputs)
+            print_(f'Tokens collected: {expert_output.size()}')
+            # print(f"{self.config.layer_id}-th layer: "\
+            #     + f"The gating output of size {combined_weights.size()} is {combined_weights}\n"\
+            #     + f"The expert output of size {expert_output.size()} is {expert_output[:3]} \n") # Normal stuff
             output = self.scale_expert_output(attention_output,
                                               expert_output,
                                               combined_weights)
+            print_(f'Experts output scaled')
             ################################################
+            # print(f"{self.config.layer_id}-th layer: First 3 rows of MoE output after the scale is {output[:3]}") # Here we got these zeros!
 
             if self.expert_mp_group is not None:
                 output = output.split(output.shape[0] //
                                       dist.get_world_size(group=self.expert_mp_group),
                                       dim=0)[dist.get_rank(group=self.expert_mp_group)]
+            # print(f"{self.config.layer_id}-th layer: First 3 rows of MoE output before bias and residual is {output[:3]}") # Here we got these zeros!
 
             if self.config.mlp_type == 'residual':
                 inference_cuda_module.moe_res_matmul(res_mlp_out, res_coef_out, output)
@@ -459,6 +502,7 @@ class DeepSpeedMoEInference(nn.Module):
             if input_type != output.dtype:
                 output = output.to(input_type)
 
+        print_(f"{self.config.layer_id}-th layer: NaN present? {torch.isnan(output).any()} First 3 rows of MoE output is {output[:3]}")
         if get_present:
             output = (output, presents)
 
@@ -466,3 +510,10 @@ class DeepSpeedMoEInference(nn.Module):
             return output if type(output) is tuple else (output, )
         else:
             return output
+
+def get_nvidia_smi_gpu_memory_stats_str():
+    return f"nvidia-smi stats: ALLOC: {torch.cuda.memory_allocated()/1024/1024/1024:.3f}GB, RESERVED: {torch.cuda.memory_reserved()/1024/1024/1024:.3f}GB"
+
+def print_(content, *args, **kwargs):
+    torch.cuda.synchronize()
+    print(content, *args, **kwargs)

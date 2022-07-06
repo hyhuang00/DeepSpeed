@@ -64,7 +64,7 @@ class MoE(torch.nn.Module):
 
         assert noisy_gate_policy is None or noisy_gate_policy in ['None', 'Jitter', 'RSample'], \
             'Unsupported noisy_gate_policy: ' + noisy_gate_policy
-
+        print(f"capacity factors: {capacity_factor}/{eval_capacity_factor}")
         experts = Experts(expert, self.num_local_experts, self.expert_group_name)
         self.deepspeed_moe = MOELayer(TopKGate(hidden_size,
                                                num_experts,

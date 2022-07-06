@@ -181,6 +181,7 @@ def replace_transformer_layer(orig_layer_impl,
     Returns:
         Updated nn.module with replaced transformer layers
     """
+    # HH: FIXME -- Here a default policy is injected and will replace the settings we set via args.
     def replace_with_policy(child,
                             policy_cls,
                             triangular_masking,
@@ -250,6 +251,9 @@ def replace_transformer_layer(orig_layer_impl,
                 ep_world_size = torch.distributed.get_world_size()
                 local_ep_size = 1 if num_experts < ep_world_size else num_experts // ep_world_size
 
+                # This is buggy -- configuration that are not mentioned here will get replaced by default values
+                # This can be fixed with inserting the correct the config
+                # Rewrote by Haiyang Huang (hyhuang@cs.duke.edu)
                 transformer_config = transformer_inference.DeepSpeedMoEInferenceConfig(
                     hidden_size=hidden_size,
                     heads=num_attention_heads,
@@ -262,7 +266,16 @@ def replace_transformer_layer(orig_layer_impl,
                     q_int8=quantize,
                     moe_experts=local_ep_size,
                     global_experts=num_experts,
-                    mlp_type=moe_type)
+                    mlp_type=moe_type,
+                    k=config.topk, # HH: FIXME: name inconsistency
+                    capacity_factor=config.moe_train_capacity_factor, # HH: FIXME: name inconsistency
+                    eval_capacity_factor=config.moe_eval_capacity_factor, # HH: FIXME: name inconsistency
+                    drop_tokens=config.moe_token_dropping, # HH: FIXME: name inconsistency
+                    min_capacity=config.moe_min_capacity, # HH: FIXME: name inconsistency
+                    local_rank=config.config.local_rank if hasattr(config,
+                                                               'window_size') else -1, # HH: FIXME: name inconsistency
+                    ) # CUBLAS_STATUS_EXECUTION_FAILED
+                    # intermediate_size=-1, # Default to 4x hiddensize
             else:
                 rotary_dim = config.rotary_dim if hasattr(config, 'rotary_dim') else child.attention.rotary_ndims \
                                             if hasattr(child, 'attention') and hasattr(child.attention,'rotary_ndims') else -1
@@ -290,7 +303,10 @@ def replace_transformer_layer(orig_layer_impl,
                                                                'window_size') else 1),
                     rotary_dim=rotary_dim,
                     mlp_after_attn=(rotary_dim is None or rotary_dim < 0),
-                    training_mp_size=training_mp_size)
+                    training_mp_size=training_mp_size,
+                    local_rank=config.local_rank if hasattr(config,
+                                                               'window_size') else -1
+                    )
 
             if quantize and quantize_settings is not None:
                 (quantization_scales,
@@ -393,8 +409,9 @@ def replace_transformer_layer(orig_layer_impl,
 
             dense_b = dense_b if dense_b is None else dense_b * (
                 transformer_config.training_mp_size / transformer_config.mp_size)
-            _4hh_b = _4hh_b * (transformer_config.training_mp_size /
-                               transformer_config.mp_size)
+            # print("Bad config is ", transformer_config.training_mp_size, transformer_config.mp_size)
+            _4hh_b = _4hh_b * int(transformer_config.training_mp_size /
+                               transformer_config.mp_size) # fix the incorrect type by force typecasting
 
             if mlp_linear_layer:
                 _h4h_w = [transpose(moe_w1.data)
@@ -575,7 +592,7 @@ def replace_transformer_layer(orig_layer_impl,
         else:
             if orig_layer_impl is HFGPT2LayerPolicy._orig_layer_class:
                 try:
-                    import transformers
+                    import transformers # Huggingface TFMR
                     conv_linear_layer = True
                     linear_policies = {transformers.model_utils.Conv1D: _replace}
                 except ImportError:

@@ -2,7 +2,7 @@ from typing import List, Tuple, Dict
 import torch
 import deepspeed.utils.groups as groups
 from .layer import MoE
-
+import subprocess
 
 def has_moe_layers(m):
     has_moe = False

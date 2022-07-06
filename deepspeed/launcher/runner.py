@@ -1,5 +1,6 @@
 # Copyright 2020 The Microsoft DeepSpeed Team
 """
+HH: This is the main funcion that is called.
 DeepSpeed runner is the main front-end to launching multi-worker
 training jobs with DeepSpeed. By default this uses pdsh to parallel
 ssh into multiple worker nodes and launch all the necessary processes

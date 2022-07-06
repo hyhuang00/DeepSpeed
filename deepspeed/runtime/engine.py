@@ -2410,6 +2410,7 @@ class DeepSpeedEngine(Module):
             mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
             mp_rank_str = f"{mp_rank:02d}"
 
+        # This is the hack that gives us the real filename
         if self.zero_optimization_partition_weights():
             filename = "zero_pp_rank_{}".format(
                 torch.distributed.get_rank(group=self.optimizer.dp_process_group))
@@ -2997,7 +2998,7 @@ class DeepSpeedEngine(Module):
         return success
 
     def _save_checkpoint(self, save_dir, tag, client_state={}):
-
+        # Is this hack being used? Yes
         save_path = self._get_ckpt_name(save_dir, tag)
         # A hack to save the checkpointing directory. Pipeline parallelism overrides
         # module_state_dict() and uses this path to save the model. module_state_dict()
